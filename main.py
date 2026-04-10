@@ -31,6 +31,10 @@ while True:
         # MODO ACTIVO: Mochi está escuchando o pensando
         draw_face("happy") # Cara de "te escucho"
         wav_path = record_audio()
+        if not wav_path:
+            print("⚠️ No se pudo grabar audio, reintentando ciclo.")
+            time.sleep(0.5)
+            continue
         
         # Inmediatamente después de grabar, ponemos cara de pensar para ganar tiempo
         draw_face("thinking")
@@ -68,7 +72,8 @@ while True:
                 active_mode = False
             else:
                 # Si no ha pasado el tiempo límite, sigue atento pero con cara neutra
-                draw_face("thinking")
+                draw_face("surprised")
+                speak("No te escuché bien. ¿Me lo repites despacito?")
                 time.sleep(0.5)
 
     except KeyboardInterrupt:
