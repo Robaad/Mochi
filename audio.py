@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 import shutil
+import select
 import sounddevice as sd
 import scipy.io.wavfile as wav
 import tempfile
@@ -129,15 +130,22 @@ def speak(text):
         piper_process.stdin.flush()
 
         # Piper no indica tamaño exacto por frase en flujo continuo.
-        # Leemos por ventanas cortas hasta silencio aparente.
+        # Evitamos bloqueos usando select() sobre el pipe.
         chunks = []
         quiet_windows = 0
-        while quiet_windows < 2:
-            data = piper_process.stdout.read(2048)
+        max_quiet_windows = 6
+        while quiet_windows < max_quiet_windows:
+            ready, _, _ = select.select([piper_process.stdout], [], [], 0.25)
+            if not ready:
+                quiet_windows += 1
+                continue
+
+            data = os.read(piper_process.stdout.fileno(), 4096)
             if not data:
                 quiet_windows += 1
-                time.sleep(0.05)
+                time.sleep(0.03)
                 continue
+
             chunks.append(data)
             quiet_windows = 0 if any(b != 0 for b in data) else quiet_windows + 1
             if len(chunks) > 700:  # límite de seguridad
