@@ -1,123 +1,182 @@
+# ─── audio.py ─────────────────────────────────────────────────────────────────
+# Entrada:  micrófono USB → WAV temporal con detección de silencio por RMS
+# Salida:   texto → Piper (WAV temporal) → pygame mixer
+#
+# Por qué WAV temporal en vez de --output-raw:
+#   En RPi3, Piper con --output-raw pipe→aplay introduce latencia extra
+#   porque aplay no empieza hasta recibir datos suficientes para su buffer.
+#   Con --output-file generamos el WAV completo y pygame lo reproduce
+#   directamente desde memoria, sin buffer de red ni ALSA extra.
+#   El warning de onnxruntime GPU es inofensivo — RPi no tiene GPU ONNX.
+
 import os
 import re
 import subprocess
-import sounddevice as sd
-import scipy.io.wavfile as wav
+import threading
 import tempfile
-import time
 import atexit
-from config import SAMPLE_RATE, RECORD_SECONDS, MIC_DEVICE
+import numpy as np
+import sounddevice as sd
+import scipy.io.wavfile as wav_io
+import pygame
 
-# --- CONFIGURACIÓN ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Usamos el modelo x_low de Carl (asegúrate de que el nombre coincida tras el wget)
-MODEL_PATH = os.path.join(BASE_DIR, "es_ES-carlfm-x_low.onnx")
-piper_process = None
+from config import (
+    SAMPLE_RATE, CHANNELS, RECORD_SECONDS,
+    MIC_DEVICE, SILENCE_THRESHOLD,
+    TTS_MODEL_PATH, TTS_LENGTH_SCALE, AUDIO_OUT_DEV,
+)
 
-def start_piper():
-    """Inicia el proceso de Piper en modo streaming."""
-    global piper_process
-    if piper_process:
-        try: piper_process.terminate()
-        except: pass
-    
+# ── pygame mixer ───────────────────────────────────────────────────────────────
+# frequency=22050 coincide exactamente con la salida de Piper carlfm x_low.
+# size=-16 = signed 16-bit. channels=1 = mono. buffer=512 = baja latencia.
+# device: pygame usa ALSA_DEVICE o SDL_AUDIODEV — lo forzamos vía env.
+os.environ["AUDIODEV"]      = AUDIO_OUT_DEV   # SDL_AUDIODEV para pygame
+os.environ["ALSA_CARD"]     = AUDIO_OUT_DEV   # por si acaso
+
+try:
+    pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=512)
+    pygame.mixer.init()
+    print(f"✓ pygame mixer listo ({pygame.mixer.get_init()})")
+except Exception as e:
+    print(f"✗ pygame mixer error: {e} — intentando con defaults")
     try:
-        env = os.environ.copy()
-        env["ONNXRUNTIME_DEVICE_PRIORITY"] = "CPU"
-        
-        # length_scale 0.85: Más rápido = más energía infantil
-        piper_cmd = [
-            "piper", "--model", MODEL_PATH, 
-            "--output-raw", "--length_scale", "0.85"
-        ]
-        
-        piper_process = subprocess.Popen(
-            piper_cmd, 
-            stdin=subprocess.PIPE, 
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, 
-            env=env
+        pygame.mixer.init()
+    except Exception as e2:
+        print(f"✗ pygame no disponible: {e2}")
+
+# ── Verificar Piper ────────────────────────────────────────────────────────────
+def _check_piper() -> bool:
+    try:
+        subprocess.run(["piper", "--version"], capture_output=True, timeout=3)
+        print("✓ Piper TTS listo")
+        return True
+    except FileNotFoundError:
+        print("✗ Piper no encontrado")
+        return False
+    except Exception:
+        print("✓ Piper TTS listo")
+        return True
+
+_PIPER_OK = _check_piper()
+
+# Lock para serializar reproducción
+_speak_lock = threading.Lock()
+
+# ── Grabación ─────────────────────────────────────────────────────────────────
+
+def _rms(audio: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(audio.astype(np.float32) ** 2))) / 32768.0
+
+
+def record_audio() -> "str | None":
+    """Graba RECORD_SECONDS. Devuelve ruta WAV o None si silencio."""
+    try:
+        print("🎤 Escuchando…")
+        audio = sd.rec(
+            int(RECORD_SECONDS * SAMPLE_RATE),
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="int16",
+            device=MIC_DEVICE,
         )
-    except Exception as e:
-        print(f"❌ Error al iniciar Piper: {e}")
-
-# Arrancamos el motor de voz al importar el módulo
-start_piper()
-
-def record_audio():
-    """Graba audio del micrófono y lo guarda en un temporal."""
-    print("🎤 Escuchando...")
-    try:
-        audio = sd.rec(int(RECORD_SECONDS * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype="int16", device=MIC_DEVICE)
         sd.wait()
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        wav.write(tmp.name, SAMPLE_RATE, audio)
-        return tmp.name
+
+        if _rms(audio) < SILENCE_THRESHOLD:
+            return None
+
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        wav_io.write(path, SAMPLE_RATE, audio)
+        return path
+
     except Exception as e:
-        print(f"❌ Error grabando: {e}")
+        print(f"✗ Error grabando: {e}")
         return None
 
-def process_and_play(text_fragment):
-    """Procesa una frase corta y la reproduce inmediatamente."""
-    global piper_process
-    if not text_fragment or len(text_fragment) < 2:
+
+# ── TTS ────────────────────────────────────────────────────────────────────────
+
+def _speak_fragment(text: str):
+    """Sintetiza una frase con Piper → WAV temporal → pygame. Bloqueante."""
+    if not _PIPER_OK or not text.strip():
         return
 
-    try:
-        # Si el proceso Piper ha muerto, lo revivimos
-        if piper_process.poll() is not None:
-            start_piper()
+    # Generamos WAV en un fichero temporal — evita el problema del pipe/buffer
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
 
-        # Enviamos la frase a Piper
-        input_data = (text_fragment + "\n").encode('utf-8')
-        
-        # Timeout de 10s para evitar bloqueos si la Pi está saturada
-        audio_data, _ = piper_process.communicate(input=input_data, timeout=10)
+    cmd = [
+        "piper",
+        "--model",        TTS_MODEL_PATH,
+        "--output_file",  wav_path,        # WAV completo, no raw
+        "--length_scale", str(TTS_LENGTH_SCALE),
+    ]
 
-        if audio_data:
-            # -r 32000: Sube el tono (Pitch) para que la voz de Carl sea de niño/robot
-            aplay_cmd = [
-                "aplay", "-D", "plughw:1,0", 
-                "-r", "32000", "-f", "S16_LE", 
-                "-t", "raw", "-q"
-            ]
-            subprocess.run(aplay_cmd, input=audio_data)
-        
-        # Reiniciamos Piper para la siguiente frase (communicate cierra el flujo)
-        start_piper()
-            
-    except Exception as e:
-        print(f"❌ Error en fragmento de voz: {e}")
-        start_piper()
+    with _speak_lock:
+        try:
+            result = subprocess.run(
+                cmd,
+                input=(text.strip() + "\n").encode("utf-8"),
+                capture_output=True,
+                timeout=15,
+            )
 
-def speak(text):
-    """
-    Función principal llamada desde main.py. 
-    Divide el texto largo en frases para que Mochi empiece a hablar antes.
-    """
-    if not text:
+            # El warning de onnxruntime va a stderr pero returncode=0 → ok
+            if result.returncode != 0:
+                err = result.stderr.decode(errors="ignore")
+                # Ignorar warnings de GPU, solo mostrar errores reales
+                real_errors = [l for l in err.splitlines()
+                               if "[W:" not in l and "[I:" not in l and l.strip()]
+                if real_errors:
+                    print(f"✗ Piper error: {real_errors[0][:120]}")
+                return
+
+            if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 100:
+                print("✗ Piper: WAV vacío")
+                return
+
+            # Reproducir con pygame
+            try:
+                sound = pygame.mixer.Sound(wav_path)
+                channel = sound.play()
+                while channel.get_busy():
+                    pygame.time.wait(20)
+            except Exception as e:
+                print(f"✗ pygame play error: {e}")
+
+        except subprocess.TimeoutExpired:
+            print("✗ Piper timeout")
+        except Exception as e:
+            print(f"✗ TTS error: {e}")
+        finally:
+            try:
+                os.unlink(wav_path)
+            except Exception:
+                pass
+
+
+_SPLIT_RE = re.compile(r"(?<=[.!?¿¡:])\s+")
+_CLEAN_RE  = re.compile(r"\*[^*]*\*|\[[^\]]*\]|[^\w\s,.:¡!¿?áéíóúÁÉÍÓÚñÑ]")
+
+
+def speak(text: str):
+    """Limpia, parte en frases y reproduce en orden."""
+    clean = _CLEAN_RE.sub("", text).strip()
+    if not clean:
         return
 
-    # 1. Limpieza de texto (filtramos emojis y asteriscos de acciones)
-    clean_text = re.sub(r'\*.*?\*', '', text)
-    clean_text = re.sub(r'[^\w\s,.:¡!¿?áéíóúÁÉÍÓÚñÑ]', '', clean_text).strip()
-    
-    if not clean_text:
-        return
+    frases = [f.strip() for f in _SPLIT_RE.split(clean) if len(f.strip()) > 1]
+    if not frases:
+        frases = [clean]
 
-    # 2. Troceado por signos de puntuación
-    # Esto permite que si la IA responde un párrafo, Mochi diga la frase 1 mientras procesa la 2.
-    frases = re.split(r'[.!?:]', clean_text)
-    
     for frase in frases:
-        f = frase.strip()
-        if len(f) > 1:
-            print(f"Mochi dice: {f}")
-            process_and_play(f)
+        _speak_fragment(frase)
 
-def close_piper():
-    """Asegura que Piper se cierre al apagar el programa."""
-    if piper_process:
-        piper_process.terminate()
 
-atexit.register(close_piper)
+def shutdown():
+    try:
+        pygame.mixer.quit()
+    except Exception:
+        pass
+
+atexit.register(shutdown)
