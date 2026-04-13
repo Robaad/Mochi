@@ -141,9 +141,10 @@ def _rms(audio: np.ndarray) -> float:
 
 
 def record_audio() -> "str | None":
-    """Graba RECORD_SECONDS. Devuelve ruta WAV o None si silencio."""
+    """Graba a 44.1kHz y convierte a 16kHz para Whisper."""
     try:
         print("🎤 Escuchando…")
+        # Grabamos a la frecuencia nativa del micro (44.1k)
         audio = sd.rec(
             int(RECORD_SECONDS * SAMPLE_RATE),
             samplerate=SAMPLE_RATE,
@@ -156,84 +157,66 @@ def record_audio() -> "str | None":
         if _rms(audio) < SILENCE_THRESHOLD:
             return None
 
+        # --- TRUCO: Re-muestreo para Whisper ---
+        from scipy.signal import resample
+        # Calculamos cuántas muestras son a 16000Hz
+        num_samples_16k = int(len(audio) * 16000 / SAMPLE_RATE)
+        audio_16k = resample(audio, num_samples_16k).astype(np.int16)
+
         fd, path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
-        wav_io.write(path, SAMPLE_RATE, audio)
+        # Guardamos a 16000 para que la IA no se líe
+        wav_io.write(path, 16000, audio_16k) 
         return path
 
     except Exception as e:
         print(f"✗ Error grabando: {e}")
         return None
 
-
 # ── TTS ────────────────────────────────────────────────────────────────────────
 
 def _speak_fragment(text: str):
-    """Sintetiza una frase con Piper → WAV temporal → pygame. Bloqueante."""
     if not _PIPER_OK or not text.strip():
         return
 
-    # Generamos WAV en un fichero temporal — evita el problema del pipe/buffer
     fd, wav_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
 
+    # Asegúrate de que MODEL_PATH sea absoluto
     cmd = [
         "piper",
-        "--model",        TTS_MODEL_PATH,
-        "--output_file",  wav_path,        # WAV completo, no raw
+        "--model", TTS_MODEL_PATH,
+        "--output_file", wav_path,
         "--length_scale", str(TTS_LENGTH_SCALE),
     ]
 
     with _speak_lock:
         try:
+            # Añadimos env=os.environ para que Piper vea las librerías del sistema
             result = subprocess.run(
                 cmd,
                 input=(text.strip() + "\n").encode("utf-8"),
                 capture_output=True,
-                timeout=15,
+                env=os.environ.copy(), 
+                timeout=15
             )
 
-            # El warning de onnxruntime va a stderr pero returncode=0 → ok
             if result.returncode != 0:
-                err = result.stderr.decode(errors="ignore")
-                # Ignorar warnings de GPU, solo mostrar errores reales
-                real_errors = [l for l in err.splitlines()
-                               if "[W:" not in l and "[I:" not in l and l.strip()]
-                if real_errors:
-                    print(f"✗ Piper error: {real_errors[0][:120]}")
+                print(f"✗ Piper error code {result.returncode}")
+                # Imprime el error real para debuguear
+                print(result.stderr.decode())
                 return
 
-            if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 100:
-                print("✗ Piper: WAV vacío")
-                return
-
-            # Reproducir con pygame
-            try:
+            if os.path.exists(wav_path) and os.path.getsize(wav_path) > 100:
                 sound = pygame.mixer.Sound(wav_path)
                 channel = sound.play()
                 while channel.get_busy():
-                    pygame.time.wait(20)
-            except Exception as e:
-                print(f"✗ pygame play error: {e}")
-                try:
-                    subprocess.run(
-                        ["aplay", "-q", "-D", _AUDIO_OUT_DEV_RESOLVED, wav_path],
-                        timeout=10,
-                        check=False,
-                    )
-                except Exception as e2:
-                    print(f"✗ fallback aplay error: {e2}")
-
-        except subprocess.TimeoutExpired:
-            print("✗ Piper timeout")
+                    pygame.time.wait(10)
         except Exception as e:
             print(f"✗ TTS error: {e}")
         finally:
-            try:
+            if os.path.exists(wav_path):
                 os.unlink(wav_path)
-            except Exception:
-                pass
-
 
 _SPLIT_RE = re.compile(r"(?<=[.!?¿¡:])\s+")
 _CLEAN_RE  = re.compile(r"\*[^*]*\*|\[[^\]]*\]|[^\w\s,.:¡!¿?áéíóúÁÉÍÓÚñÑ]")
