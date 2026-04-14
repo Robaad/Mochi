@@ -1,184 +1,174 @@
 # ─── main.py ──────────────────────────────────────────────────────────────────
-# Arquitectura pipeline:
+# Bucle principal de Mochi. Arquitectura:
 #
-#   [Botón GPIO]
-#        │
-#        ▼
-#   record_audio()          ← hilo principal, bloquea RECORD_SECONDS
-#        │
-#        ▼
-#   transcribe()            ← hilo worker (no bloquea display ni botón)
-#        │
-#        ▼
-#   chat()                  ← en el mismo worker
-#        │
-#        ▼
-#   draw_face() + speak()   ← display en su hilo, TTS en worker
+#  ESPERA (botón) → GRABA (arecord) → TRANSCRIBE (Voxtral) →
+#  STREAM CHAT (Mistral) → HABLA solapado (Piper + aplay) → vuelta
 #
-# Gracias al hilo del display (display.py) la cara se actualiza aunque
-# el worker esté ocupado con la API. Piper corre en proceso persistente.
+# Un solo hilo principal + hilo del display + hilo producer de Piper.
+# Sin pygame, sin sounddevice, sin resample.
 
-import os
-import sys
-import time
-import threading
-import signal
-
+import os, sys, time, signal, threading
 import gpiozero
-
 import display
-import audio
-from mistral_api import transcribe, chat, reset_history
-from config import BUTTON_PIN, INACTIVITY_LIMIT
+import tts
+import brain
+from config import BUTTON_PIN, INACTIVITY_SEC
 
-# ── Estado global ──────────────────────────────────────────────────────────────
-_active   = threading.Event()    # True = Mochi despierto
-_busy     = threading.Event()    # True = procesando respuesta (no grabar)
-_shutdown = threading.Event()    # True = salir
-
-_last_interaction = 0.0
+# ── Estado ─────────────────────────────────────────────────────────────────────
+_awake    = threading.Event()
+_quit     = threading.Event()
+_last_t   = 0.0
 
 # ── Botón ──────────────────────────────────────────────────────────────────────
 try:
-    _button = gpiozero.Button(BUTTON_PIN, pull_up=True, bounce_time=0.1)
+    _btn = gpiozero.Button(BUTTON_PIN, pull_up=True, bounce_time=0.15)
 except Exception as e:
-    print(f"⚠ Botón GPIO no disponible ({e}). Usa Enter para activar.")
-    _button = None
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
+    print(f"⚠ GPIO no disponible ({e}) — usa Enter")
+    _btn = None
 
 def _wake():
-    global _last_interaction
-    if _active.is_set():
+    global _last_t
+    if _awake.is_set():
+        # Si ya está despierto, el botón reinicia el timer de inactividad
+        _last_t = time.time()
         return
-    print("✨ Mochi despertando…")
-    _active.set()
-    _last_interaction = time.time()
-    display.draw_face("excited")
-    # Hablar en hilo para no bloquear
-    t = threading.Thread(target=audio.speak,
-                         args=("¿Qué hay?",), daemon=True)
-    t.start()
+    print("✨ Mochi despierto")
+    _awake.set()
+    _last_t = time.time()
+    display.face("excited")
+    tts.speak_simple("¿Qué hay?")
 
 def _sleep():
-    print("💤 Mochi a dormir")
-    _active.clear()
-    reset_history()
-    display.draw_face("sleeping")
-    audio.speak("Hasta luego.")
+    print("💤 Mochi duerme")
+    _awake.clear()
+    brain.reset()
+    display.face("sleeping")
+    tts.speak_simple("Hasta luego.")
 
-# ── Conectar botón ─────────────────────────────────────────────────────────────
-if _button:
-    _button.when_pressed = _wake
+if _btn:
+    _btn.when_pressed = _wake
 
-# ── Worker de conversación ─────────────────────────────────────────────────────
+# ── Señales ────────────────────────────────────────────────────────────────────
 
-def _conversation_worker(wav_path: str):
-    """
-    Hilo que procesa un turno completo: transcribe → chat → habla.
-    Se marca _busy durante todo el proceso.
-    """
-    global _last_interaction
+def _bye(sig, frame):
+    print("\nApagando…")
+    _quit.set()
+    display.face("sleeping")
+    time.sleep(0.2)
+    display.off()
+    sys.exit(0)
 
-    _busy.set()
-    display.draw_face("thinking")
+signal.signal(signal.SIGINT,  _bye)
+signal.signal(signal.SIGTERM, _bye)
 
+# ── Turno de conversación ──────────────────────────────────────────────────────
+
+def _turn():
+    """Un turno completo: graba → transcribe → responde."""
+    global _last_t
+
+    # 1. Grabar
+    display.face("happy")
+    wav = brain.record()
+
+    if wav is None:
+        # Silencio — comprobar inactividad
+        if _awake.is_set() and time.time() - _last_t > INACTIVITY_SEC:
+            _sleep()
+        elif _awake.is_set() and time.time() - _last_t > INACTIVITY_SEC * 0.6:
+            display.face("sleepy")
+        return
+
+    # 2. Transcribir (cara pensando mientras espera)
+    display.face("thinking")
+    text = brain.transcribe(wav)
     try:
-        # 1. Transcripción
-        text = transcribe(wav_path)
-        if os.path.exists(wav_path):
-            os.unlink(wav_path)
+        os.unlink(wav)
+    except Exception:
+        pass
 
-        if not text:
-            display.draw_face("happy")
-            _busy.clear()
-            return
+    if not text:
+        display.face("happy")
+        return
 
-        print(f"  Tú → {text}")
+    print(f"  Tú  → {text}")
+    _last_t = time.time()
 
-        # 2. Chat
-        reply, emotion = chat(text)
-        print(f"Mochi [{emotion}] → {reply}")
+    # 3. Streaming: Mistral genera y Piper habla en paralelo
+    #    chat_stream() es un generador → tts.speak() consume frases
+    #    conforme llegan, solapando síntesis y reproducción.
 
-        _last_interaction = time.time()
+    frases_iter  = brain.chat_stream(text)
+    emotion      = "happy"
+    frase_buffer = []
 
-        # 3. Cara + animación de boca + voz
-        display.draw_face(emotion)
-        display.start_talking()
-        audio.speak(reply)
-        display.stop_talking()
-        display.draw_face(emotion)
+    display.face("thinking")
 
-    except Exception as e:
-        print(f"✗ Worker error: {e}")
-        display.draw_face("nervous")
-        display.stop_talking()
+    def _producer_and_play():
+        """Recorre el stream y habla cada frase en cuanto llega."""
+        nonlocal emotion
+        import queue as _queue
+        import tts as _tts
+        import re as _re
 
-    finally:
-        _busy.clear()
+        wav_q: "_queue.Queue[str | None]" = _queue.Queue(maxsize=3)
+
+        def _synth_worker():
+            for frase, em in frases_iter:
+                if em is not None:
+                    emotion = em
+                    wav_q.put(None)   # fin
+                    return
+                if frase:
+                    frase_buffer.append(frase)
+                    wav = _tts._synthesize(frase)
+                    wav_q.put(wav)
+            wav_q.put(None)
+
+        synth_t = threading.Thread(target=_synth_worker, daemon=True)
+        synth_t.start()
+
+        first = True
+        while True:
+            wav = wav_q.get()
+            if wav is None:
+                break
+            if first:
+                # Primera frase lista — ahora sí mostramos emoción
+                display.face(emotion if emotion != "happy" else "happy")
+                display.talking(True)
+                first = False
+            _tts._play(wav)
+
+        display.talking(False)
+
+    _producer_and_play()
+
+    # Emoción final en la cara
+    display.face(emotion)
+    resp_text = " ".join(frase_buffer)
+    print(f"Mochi [{emotion}] → {resp_text}")
 
 # ── Bucle principal ────────────────────────────────────────────────────────────
 
-def _main_loop():
-    global _last_interaction
+def main():
+    print("🤖 Mochi listo —", "pulsa el botón" if _btn else "pulsa Enter para despertar")
+    display.face("sleeping")
 
-    print("🤖 Mochi listo. " + ("Pulsa el botón." if _button else "Pulsa Enter para despertar."))
-    display.draw_face("sleeping")
+    while not _quit.is_set():
 
-    while not _shutdown.is_set():
-
-        # Modo espera — esperando botón (o Enter si no hay botón)
-        if not _active.is_set():
-            if not _button:
+        if not _awake.is_set():
+            if not _btn:
                 try:
-                    input()   # Enter en consola como fallback
+                    input()
                     _wake()
                 except EOFError:
-                    time.sleep(0.5)
+                    time.sleep(0.3)
             else:
                 time.sleep(0.1)
             continue
 
-        # Comprobar inactividad
-        if time.time() - _last_interaction > INACTIVITY_LIMIT:
-            _sleep()
-            continue
-
-        # Si el worker anterior todavía está procesando, esperamos
-        if _busy.is_set():
-            time.sleep(0.05)
-            continue
-
-        # ── Grabar ────────────────────────────────────────────────────────────
-        display.draw_face("happy")
-        wav = audio.record_audio()
-
-        if wav is None:
-            # Silencio detectado — no lanzamos worker
-            elapsed = time.time() - _last_interaction
-            if elapsed > INACTIVITY_LIMIT * 0.7:
-                display.draw_face("sleepy")
-            continue
-
-        # Lanzar worker en hilo para no bloquear el loop
-        t = threading.Thread(target=_conversation_worker, args=(wav,), daemon=True)
-        t.start()
-
-# ── Señales del SO ─────────────────────────────────────────────────────────────
-
-def _handle_signal(sig, frame):
-    print("\nApagando Mochi…")
-    _shutdown.set()
-    display.draw_face("sleeping")
-    time.sleep(0.3)
-    display.shutdown()
-    audio.shutdown()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT,  _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
-
-# ── Entry point ────────────────────────────────────────────────────────────────
+        _turn()
 
 if __name__ == "__main__":
-    _main_loop()
+    main()
